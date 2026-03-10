@@ -1,0 +1,159 @@
+param(
+    [string]$FortiGate = "TARGET",
+    [string]$ApiToken  = "RESTAPIKEY",
+    [string]$MatchPhrase = 'VPN_Block',
+    [string]$ExcludePhrase = 'ADDR',
+    [switch]$SkipCertificateCheck,
+    [switch]$DryRun = $true
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+if ($SkipCertificateCheck) {
+    Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+
+$FortiGate = $FortiGate.Trim()
+if ($FortiGate -notmatch '^https?://') {
+    $FortiGate = "https://$FortiGate"
+}
+$FortiGate = $FortiGate.TrimEnd('/')
+
+$baseUri = "$FortiGate/api/v2/cmdb/firewall/address"
+
+$headers = @{
+    Authorization = "Bearer $ApiToken"
+    Accept        = "application/json"
+}
+
+function Invoke-FortiGateApi {
+    param(
+        [ValidateSet('GET','DELETE')]
+        [string]$Method,
+        [string]$Uri
+    )
+
+    Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ContentType 'application/json'
+}
+
+function Get-MatchingAddresses {
+    $encodedMatch = [System.Uri]::EscapeDataString("name=@$MatchPhrase")
+    $uri = "$($baseUri)?format=name&q_origin_key&filter=$encodedMatch"
+
+    Write-Host "GET $uri"
+    $resp = Invoke-FortiGateApi -Method GET -Uri $uri
+
+    if (-not $resp.results) {
+        return @()
+    }
+
+    return $resp.results | ForEach-Object {
+        $n = if ($_.q_origin_key) { $_.q_origin_key } elseif ($_.name) { $_.name } else { $null }
+        if ($n) {
+            [PSCustomObject]@{ Name = $n }
+        }
+    } | Sort-Object Name -Unique
+}
+
+function Remove-AddressByName {
+    param([string]$Name)
+
+    $encodedName = [System.Uri]::EscapeDataString($Name)
+    $uri = "$($baseUri)/$encodedName"
+    Invoke-FortiGateApi -Method DELETE -Uri $uri | Out-Null
+}
+
+try {
+    Write-Host "Using base URI: $baseUri"
+    Write-Host "Finding address objects containing '$MatchPhrase' but excluding '$ExcludePhrase'..."
+
+    $allCandidates = Get-MatchingAddresses
+
+    $targets = $allCandidates | Where-Object {
+        $_.Name -notlike "*$ExcludePhrase*"
+    }
+
+    $skipped = $allCandidates | Where-Object {
+        $_.Name -like "*$ExcludePhrase*"
+    }
+
+    Write-Host ""
+    Write-Host "Matched address objects: $($allCandidates.Count)"
+    Write-Host "Will delete: $($targets.Count)"
+    Write-Host "Will preserve: $($skipped.Count)"
+    Write-Host ""
+
+    if ($targets.Count -gt 0) {
+        Write-Host "Delete candidates:"
+        $targets | Select-Object -First 100 | ForEach-Object {
+            Write-Host "  [DELETE] $($_.Name)"
+        }
+        if ($targets.Count -gt 100) {
+            Write-Host "  ...and $($targets.Count - 100) more"
+        }
+    }
+
+    Write-Host ""
+
+    if ($skipped.Count -gt 0) {
+        Write-Host "Preserved because they contain '$ExcludePhrase':"
+        $skipped | Select-Object -First 100 | ForEach-Object {
+            Write-Host "  [SKIP]   $($_.Name)"
+        }
+        if ($skipped.Count -gt 100) {
+            Write-Host "  ...and $($skipped.Count - 100) more"
+        }
+    }
+
+    if ($DryRun) {
+        Write-Host ""
+        Write-Host "DRY RUN enabled. No address objects were deleted."
+        Write-Host "Re-run with -DryRun:`$false to perform deletion."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Deleting $($targets.Count) address objects..."
+
+    $deleted = 0
+    $failed = New-Object System.Collections.Generic.List[object]
+
+    foreach ($t in $targets) {
+        try {
+            Remove-AddressByName -Name $t.Name
+            $deleted++
+            Write-Host "[DELETED] $($t.Name)"
+        }
+        catch {
+            Write-Warning "[FAILED ] $($t.Name) -- $($_.Exception.Message)"
+            $failed.Add([PSCustomObject]@{
+                Name  = $t.Name
+                Error = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Done."
+    Write-Host "Deleted: $deleted"
+    Write-Host "Failed : $($failed.Count)"
+
+    if ($failed.Count -gt 0) {
+        $failed | Export-Csv -NoTypeInformation -Path ".\fortigate_address_delete_failures.csv"
+        Write-Host "Failure log written to .\fortigate_address_delete_failures.csv"
+    }
+}
+catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
