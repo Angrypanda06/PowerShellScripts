@@ -1,4 +1,4 @@
-﻿$Asn = "AS43444"
+$Asn = 'AS43444'
 $Uri = "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$Asn"
 
 function Convert-IPv4ToUInt32 {
